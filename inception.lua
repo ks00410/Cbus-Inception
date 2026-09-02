@@ -18,17 +18,38 @@ inception = A
 local api_token = secrets.api_token
 local API_ROOT  = secrets.API_ROOT
 
--- Inception IDs for querying APIs
-local area_id       = secrets.area_id
-local front_door_id = secrets.front_door_id
-local rear_door_id  = secrets.rear_door_id
+------------------------------
+--   Entity → Param Mapping --
+------------------------------
 
--- NAC User Parameters
+-- Each entry maps a single Inception entity ID (from secrets) to:
+--   param  : C-Bus user param name to write the decoded state into
+--   eval   : decoder function to call (assigned after functions are defined below)
+--   type   : "area" | "door" | "input" — determines which monitor subscription fires
+--
+-- To add or remove a monitored entity, edit only this table.
+
+local ENTITY_MAP = {
+  -- Alarm area
+  { id = secrets.area_id,       param = "alarmstate",      type = "area"  },
+  -- Doors
+  { id = secrets.front_door_id, param = "frontdoor",       type = "door"  },
+  { id = secrets.rear_door_id,  param = "reardoor",        type = "door"  },
+  -- Zones / inputs
+  { id = secrets.zone1,         param = "security_zone1",  type = "input" },
+  { id = secrets.zone2,         param = "security_zone2",  type = "input" },
+  { id = secrets.zone3,         param = "security_zone3",  type = "input" },
+  { id = secrets.zone4,         param = "security_zone4",  type = "input" },
+  { id = secrets.zone5,         param = "security_zone5",  type = "input" },
+  { id = secrets.zone6,         param = "security_zone6",  type = "input" },
+  { id = secrets.zone7,         param = "security_zone7",  type = "input" },
+  { id = secrets.zone8,         param = "security_zone8",  type = "input" },
+}
+
+-- Backwards-compatible named constants (used by external callers e.g. arm/disarm scripts)
 A.CBUS_USERPARAM_NAME_ALARMSTATE = "alarmstate"
 A.CBUS_USERPARAM_NAME_FRONTDOOR  = "frontdoor"
 A.CBUS_USERPARAM_NAME_REARDOOR   = "reardoor"
-
--- Zone Names
 A.CBUS_USERPARAM_NAME_ZONES = {
   "security_zone1", "security_zone2", "security_zone3", "security_zone4",
   "security_zone5", "security_zone6", "security_zone7", "security_zone8",
@@ -38,7 +59,7 @@ A.CBUS_USERPARAM_NAME_ZONES = {
        -- Utilities --
 ------------------------------
 
--- Utility Function to check if variable is empty
+-- Returns true when s is nil or an empty string.
 local function isempty(s)
   return s == nil or s == ''
 end
@@ -53,6 +74,31 @@ end
 local tsuarea   = "0"
 local tsudoors  = "0"
 local tsuinputs = "0"
+
+-- Backoff state: track consecutive failures and the earliest time the next
+-- request is allowed. Reset to zero on any successful response.
+local _failCount  = 0
+local _retryAfter = 0
+
+-- Delay (seconds) applied after each consecutive failure, capped at the last entry.
+-- 1 failure → 30 s, 2 → 60 s, 3 → 120 s, 4+ → 300 s (5 min)
+local BACKOFF_DELAYS = { 30, 60, 120, 300 }
+
+local function _recordFailure()
+  _failCount = _failCount + 1
+  local delay = BACKOFF_DELAYS[math.min(_failCount, #BACKOFF_DELAYS)]
+  _retryAfter = os.time() + delay
+  log("INCEPTION: offline or no response (failure #" .. _failCount
+      .. "). Backing off for " .. delay .. "s.")
+end
+
+local function _recordSuccess()
+  if _failCount > 0 then
+    log("INCEPTION: connection restored after " .. _failCount .. " failure(s).")
+  end
+  _failCount  = 0
+  _retryAfter = 0
+end
 
 ------------------------------
 --  INCEPTION API Functions --
@@ -76,11 +122,14 @@ function A.Inception_Post(payload, endpoint)
 
   if code ~= 200 then
     log("INCEPTION: POST error " .. tostring(code) .. " – " .. tostring(body))
+    _recordFailure()
     return nil
   elseif isempty(body) then
     -- Empty body is normal for a long-poll with no updates in 60 s; not an error.
+    _recordSuccess()
     return nil
   else
+    _recordSuccess()
     return body
   end
 end
@@ -185,11 +234,28 @@ function A.inputeval(res)
   return s
 end
 
+-- Assign eval functions into ENTITY_MAP now that they are defined.
+-- This avoids forward-reference issues while keeping the map at the top.
+local function _evalForType(t)
+  if t == "area"  then return A.areaeval
+  elseif t == "door"  then return A.dooreval
+  elseif t == "input" then return A.inputeval
+  end
+end
+
 ------------------------------
 --      Resident Poll       --
 ------------------------------
 
 function A.Resident_Poll()
+
+  -- ── Backoff check ──────────────────────────────────────────────────────────
+  if os.time() < _retryAfter then
+    local remaining = _retryAfter - os.time()
+    log("INCEPTION: skipping poll – backing off for another " .. remaining .. "s.")
+    return
+  end
+
   local json = require("json")
 
   -- Build the long-poll payload subscribing to area, door and input state changes.
@@ -216,48 +282,27 @@ function A.Resident_Poll()
   if isempty(body) then return end
 
   local httptable = json.pdecode(body)
+  local responseId = tostring(httptable["ID"])
+  local stateData  = httptable["Result"]["stateData"]
 
-  -- ── Area state ─────────────────────────────────────────────────────────────
-  if tostring(httptable["ID"]) == "CBUS-Areas-Monitor" then
-    tsuarea = tostring(httptable["Result"]["updateTime"])
-    local stateData = httptable["Result"]["stateData"]
-    for i = 1, table.getn(stateData) do
-      if stateData[i]["ID"] == area_id then
-        local status = A.areaeval(stateData[i]["PublicState"])
-        SetUserParam(0, A.CBUS_USERPARAM_NAME_ALARMSTATE, status)
-      end
-    end
+  -- Update the appropriate tsu token for this response type.
+  if     responseId == "CBUS-Areas-Monitor" then tsuarea   = tostring(httptable["Result"]["updateTime"])
+  elseif responseId == "CBUS-Doors-Monitor" then tsudoors  = tostring(httptable["Result"]["updateTime"])
+  elseif responseId == "CBUS-Input-Monitor" then tsuinputs = tostring(httptable["Result"]["updateTime"])
   end
 
-  -- ── Door state ─────────────────────────────────────────────────────────────
-  if tostring(httptable["ID"]) == "CBUS-Doors-Monitor" then
-    tsudoors = tostring(httptable["Result"]["updateTime"])
-    local stateData = httptable["Result"]["stateData"]
-    for i = 1, table.getn(stateData) do
-      local id = stateData[i]["ID"]
-      if id == front_door_id then
-        SetUserParam(0, A.CBUS_USERPARAM_NAME_FRONTDOOR, A.dooreval(stateData[i]["PublicState"]))
-      elseif id == rear_door_id then
-        SetUserParam(0, A.CBUS_USERPARAM_NAME_REARDOOR, A.dooreval(stateData[i]["PublicState"]))
-      end
-    end
-  end
-
-  -- ── Input / zone state ─────────────────────────────────────────────────────
-  if tostring(httptable["ID"]) == "CBUS-Input-Monitor" then
-    tsuinputs = tostring(httptable["Result"]["updateTime"])
-    local stateData = httptable["Result"]["stateData"]
-    local zones = {
-      secrets.zone1, secrets.zone2, secrets.zone3, secrets.zone4,
-      secrets.zone5, secrets.zone6, secrets.zone7, secrets.zone8,
-    }
-    for i = 1, table.getn(stateData) do
-      for z = 1, table.getn(zones) do
-        if stateData[i]["ID"] == zones[z] then
-          local status = A.inputeval(stateData[i]["PublicState"])
-          SetUserParam(0, A.CBUS_USERPARAM_NAME_ZONES[z], status)
+  -- Walk the state updates and write any matching entity's decoded state to C-Bus.
+  for i = 1, table.getn(stateData) do
+    local entityId = stateData[i]["ID"]
+    for _, entry in ipairs(ENTITY_MAP) do
+      if entry.id == entityId then
+        local evalFn = _evalForType(entry.type)
+        if evalFn then
+          SetUserParam(0, entry.param, evalFn(stateData[i]["PublicState"]))
         end
+        break
       end
     end
   end
+
 end
