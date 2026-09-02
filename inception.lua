@@ -16,7 +16,7 @@ inception = A
 
 -- Inception URL and Credentials
 local api_token = secrets.api_token
-local API_ROOT = secrets.API_ROOT
+local API_ROOT  = secrets.API_ROOT
 
 -- Inception IDs for querying APIs
 local area_id = secrets.area_id
@@ -73,10 +73,10 @@ http.TIMEOUT = 61 -- prevents errors, long poll is 60sec - allows some buffer
 end
 
 -- Inception Control Area
--- Allowable C_Type: Arm, ArmSleep, ArmStay
+-- Allowable C_Type: Disarm, Arm, ArmStay, ArmSleep
 
 function A.Control_Area(id, C_type)
- 
+	local json    = require("json")
 	local payload = json.encode({
 		Type = "ControlArea",
 		AreaControlType = C_type,
@@ -97,79 +97,74 @@ end
 
 -- Area Decode Function
 function A.areaeval(res)
---log("Number coming in is... " .. res)
-string = ""
-
-vals = {
-'Armed',
-'Alarm',
-'Entry Delay',
-'Exit Delay',
-'Arm Warning',
-'Defer Disarmed',
-'Detecting Active Inputs',
-'Walk Test Active',
-'Away Arm',
-'Stay Arm',
-'Sleep Arm',
-' Disarmed',
-'Arm Ready'
-}
-
-s = ''
-for i=0,#vals-1 do
-  if bit.band(res, 2^i) > 0 then
-    s = (#s>0 and s..' - '..vals[i+1]) or vals[i+1]
+  local vals = {
+    'Armed',
+    'Alarm',
+    'Entry Delay',
+    'Exit Delay',
+    'Arm Warning',
+    'Defer Disarmed',
+    'Detecting Active Inputs',
+    'Walk Test Active',
+    'Away Arm',
+    'Stay Arm',
+    'Sleep Arm',
+    'Disarmed',
+    'Arm Ready',
+  }
+  local s = ''
+  for i = 0, #vals - 1 do
+    if bit.band(res, 2^i) > 0 then
+      s = (#s > 0 and s .. ' - ' .. vals[i+1]) or vals[i+1]
+    end
   end
+  return s
 end
---log("string going out is... ".. string)
-return(s)
-end	
-	
+
 -- Door Decode Function
 function A.dooreval(res)
-vals = {
-'Unlocked',
-'Open',
-'Locked Out',
-'Forced',
-'Held Open Warning',
-'Held Open Too Long',
-'Breakglass',
-'Reader Tamper',
-'Locked',
-'Closed',
-'Held Response Muted'
-}
-
-s = ''
-for i=0,#vals-1 do
-  if bit.band(res, 2^i) > 0 then
-    s = (#s>0 and s..' - '..vals[i+1]) or vals[i+1]
+  local vals = {
+    'Unlocked',
+    'Open',
+    'Locked Out',
+    'Forced',
+    'Held Open Warning',
+    'Held Open Too Long',
+    'Breakglass',
+    'Reader Tamper',
+    'Locked',
+    'Closed',
+    'Held Response Muted',
+    'Battery Low',
+    'Lock Offline',
+  }
+  local s = ''
+  for i = 0, #vals - 1 do
+    if bit.band(res, 2^i) > 0 then
+      s = (#s > 0 and s .. ' - ' .. vals[i+1]) or vals[i+1]
+    end
   end
+  return s
 end
---log("string going out is... ".. string)
-return(s)
-end	
 
 -- Input Decode Function
 function A.inputeval(res)
-vals = {
-'Active',
-'Tamper',
-'Isolated',
-'Mask',
-'LowBattery',
-'PollFailed',
-'Sealed'
-}
-
-s = ''
-for i=0,#vals-1 do
-  if bit.band(res, 2^i) > 0 then
-    s = (#s>0 and s..' - '..vals[i+1]) or vals[i+1]
+  local vals = {
+    'Active',
+    'Tamper',
+    'Isolated',
+    'Mask',
+    'Low Battery',
+    'Poll Failed',
+    'Sealed',
+    'Wireless Door Battery Low',
+    'Wireless Door Lock Offline',
+  }
+  local s = ''
+  for i = 0, #vals - 1 do
+    if bit.band(res, 2^i) > 0 then
+      s = (#s > 0 and s .. ' - ' .. vals[i+1]) or vals[i+1]
+    end
   end
-end
---log("string going out is... ".. string)
-return(s)
+  return s
 end
