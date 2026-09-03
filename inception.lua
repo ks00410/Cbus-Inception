@@ -429,7 +429,11 @@ local function _discoverEntities()
     if not summary then
       log("INCEPTION: could not fetch " .. entityType .. " summary – skipping.")
     else
-      local entities = summary[SUMMARY_KEYS[entityType]] or {}
+      local entities = summary[SUMMARY_KEYS[entityType]]
+      if type(entities) ~= "table" then
+        log("INCEPTION: unexpected response format for " .. entityType
+            .. " summary – skipping.")
+      else
 
       -- ── Log all available entities of this type ─────────────────────────────
       -- Helps operators identify names for MONITOR_CONFIG and diagnose cases
@@ -490,6 +494,7 @@ local function _discoverEntities()
                    .. " initial state: " .. decoded, dbg)
         end
       end
+      end -- type check
     end
   end
 
@@ -523,16 +528,22 @@ local function _handleEntityStates(result, dbg)
   if not stateData then return end
 
   for i = 1, #stateData do
-    local entityId = stateData[i]["ID"]
-    for _, entry in ipairs(_entityMap) do
-      if entry.id == entityId then
-        local flagSet = FLAGS[entry.type]
-        if flagSet then
-          local status = decodeBitmask(stateData[i]["PublicState"], flagSet)
-          safeSetUserParam(CBUS_NETWORK, entry.param, status, dbg)
-          debuglog("INCEPTION: " .. entry.param .. " = " .. status, dbg)
+    local entityId   = stateData[i]["ID"]
+    local publicState = stateData[i]["PublicState"]
+    if publicState == nil then
+      debuglog("INCEPTION: entity " .. tostring(entityId)
+               .. " has no PublicState – skipping.", dbg)
+    else
+      for _, entry in ipairs(_entityMap) do
+        if entry.id == entityId then
+          local flagSet = FLAGS[entry.type]
+          if flagSet then
+            local status = decodeBitmask(publicState, flagSet)
+            safeSetUserParam(CBUS_NETWORK, entry.param, status, dbg)
+            debuglog("INCEPTION: " .. entry.param .. " = " .. status, dbg)
+          end
+          break
         end
-        break
       end
     end
   end
@@ -548,8 +559,11 @@ local function _handleReviewEvents(result, dbg)
   local latest = events[#events]
 
   -- Advance the reference tokens so the next request only returns newer events.
-  _reviewReferenceId   = tostring(latest["Id"]            or "")
-  _reviewReferenceTime = tostring(latest["ReferenceTime"] or latest["WhenTicks"] or "")
+  -- Guard against tostring(nil) producing "nil" — use raw value checks first.
+  _reviewReferenceId   = latest["Id"]            and tostring(latest["Id"])            or ""
+  _reviewReferenceTime = latest["ReferenceTime"] and tostring(latest["ReferenceTime"])
+                      or latest["WhenTicks"]     and tostring(latest["WhenTicks"])
+                      or ""
 
   -- Build a readable label from description, who, and timestamp.
   local description = tostring(latest["Description"] or "")
@@ -585,10 +599,21 @@ local function _handleActivityProgress(result, dbg)
   local resultData = result["Result"]
   if not resultData then return end
 
-  local actId   = tostring(resultData["ActivityId"] or "")
+  local actId   = resultData["ActivityId"] and tostring(resultData["ActivityId"]) or ""
   local pending = _pendingActivities[actId]
   local msgs    = resultData["Messages"]
   if not msgs or #msgs == 0 then return end
+
+  -- Warn if we receive progress for an activity we are not tracking.
+  -- This can happen if the script restarted mid-activity.
+  if actId == "" then
+    debuglog("INCEPTION: received activity progress with no ActivityId – skipping.", dbg)
+    return
+  end
+  if not pending then
+    debuglog("INCEPTION: received progress for unknown activity "
+             .. actId .. " – may be stale, ignoring.", dbg)
+  end
 
   for i = 1, #msgs do
     local msg   = msgs[i]
@@ -651,6 +676,10 @@ function A.Control_Area(id, C_type)
     log("INCEPTION: Control_Area called with nil id – ignoring.")
     return nil
   end
+  if not C_type then
+    log("INCEPTION: Control_Area called with nil C_type – ignoring.")
+    return nil
+  end
 
   local json    = require("json")
   local payload = json.encode({
@@ -705,6 +734,10 @@ function A.Control_Door(id, C_type, timeSecs)
     log("INCEPTION: Control_Door called with nil id – ignoring.")
     return nil
   end
+  if not C_type then
+    log("INCEPTION: Control_Door called with nil C_type – ignoring.")
+    return nil
+  end
 
   local json    = require("json")
   local payload = { Type = "ControlDoor", DoorControlType = C_type, Entity = id }
@@ -744,6 +777,10 @@ end
 function A.Control_Output(id, C_type, timeSecs)
   if not id then
     log("INCEPTION: Control_Output called with nil id – ignoring.")
+    return nil
+  end
+  if not C_type then
+    log("INCEPTION: Control_Output called with nil C_type – ignoring.")
     return nil
   end
 
