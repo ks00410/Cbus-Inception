@@ -1,19 +1,53 @@
+-- =============================================================================
+-- inception.lua
 -- Integrates the Inner Range Inception alarm system with C-Bus.
--- Provides long-poll state monitoring (areas, doors, inputs/zones, outputs) and
--- area arm/disarm control via the Inception REST API.
 --
--- Resident script usage:
+-- FEATURES:
+--   - Long-poll state monitoring for areas, doors, inputs/zones and outputs
+--   - Area arm/disarm control with activity progress feedback
+--   - Door control (lock, unlock, open, timed unlock, lockout, etc.)
+--   - Output control (on, off, toggle, pulse)
+--   - Dynamic entity discovery at startup — no GUIDs in secrets required
+--   - Live review event monitoring (security and access events)
+--   - Exponential backoff when the Inception system is unreachable
+--
+-- RESIDENT SCRIPT USAGE:
 --   require("user.Inception")
 --   inception.Resident_Poll()
 --
--- Area control usage (from any event script):
+-- CONTROL USAGE (from any C-Bus event script):
 --   require("user.Inception")
---   inception.Control_Area(inception.GetAreaId("House"), "Arm")
+--   inception.Control_Area(inception.GetEntityId("area", "House"), "Arm")
+--   inception.Control_Door(inception.GetEntityId("door", "Garage Office Door"), "Open")
+--   inception.Control_Output(inception.GetEntityId("output", "CCTV"), "On")
+--
+-- =============================================================================
+-- REQUIRED C-BUS USER PARAMETERS
+-- The following params must exist in the C-Bus project before running.
+-- All params are String type unless noted. Network: as set in CBUS_NETWORK.
+--
+-- Fixed params (always required):
+--   Debug Logging      Boolean — set to 1 to enable verbose logging
+--   last_alarm_event   Receives the most recent security/access event description
+--   alarmstate_detail  Receives the result of the last arm/disarm activity
+--
+-- Dynamic params (defined by MONITOR_CONFIG below):
+--   One String param per entry in MONITOR_CONFIG, named by the "param" field.
+--   Example — with the default MONITOR_CONFIG the required params are:
+--     alarmstate       Area arm state       e.g. "Armed - Away Arm"
+--     garagedoor       Garage door state    e.g. "Locked - Closed"
+--     security_zone1   Zone 1 input state   e.g. "Sealed"
+--     security_zone2   Zone 2 input state   e.g. "Active"
+--     cctv_output      CCTV output state    e.g. "Off"
+--
+--   To monitor additional entities, add entries to MONITOR_CONFIG and create
+--   matching user params in C-Bus with the same names.
+-- =============================================================================
 
 require("user.secrets")
 
 -- inception is the public module table, registered as a global so C-Bus can
--- call inception.Resident_Poll() and inception.Control_Area() from any script.
+-- call inception.Resident_Poll() and control functions from any script.
 local A = {}
 inception = A
 
@@ -34,12 +68,22 @@ local HTTP_TIMEOUT = 10
 -- allow a small buffer to avoid premature client-side timeouts.
 local HTTP_TIMEOUT_LONGPOLL = 61
 
--- C-Bus network name that owns all Inception user params.
+-- C-Bus network name that owns all Inception user parameters.
 local CBUS_NETWORK = "Ethernet"
 
 -- Name of the C-Bus user param used as a debug-logging toggle.
 -- Set it to true/1 in the C-Bus project to enable verbose logging.
 local DEBUG_PARAM = "Debug Logging"
+
+-- C-Bus user param that receives the most recent security/access review event.
+local REVIEW_EVENT_PARAM = "last_alarm_event"
+
+-- C-Bus user param that receives the result of the last area arm/disarm activity.
+local ALARM_DETAIL_PARAM = "alarmstate_detail"
+
+-- Review event categories to subscribe to via LiveReviewEvents.
+-- Accepted values: "System", "Audit", "Access", "Security", "Hardware"
+local REVIEW_CATEGORIES = "Security,Access"
 
 -- Backoff delays (seconds) applied after consecutive failed requests.
 -- Indexed by failure count; the last entry is reused for all further failures.
@@ -54,27 +98,27 @@ local BACKOFF_DELAYS = { 30, 60, 120, 300 }
 --
 -- To add or remove a monitored entity, edit only this table.
 -- Names must match exactly what is configured in the Inception system.
+-- A matching String user param must exist in C-Bus for each "param" value.
 -- =============================================================================
 
 local MONITOR_CONFIG = {
   areas = {
-    { name = "House",              param = "alarmstate"    },
+    { name = "House",              param = "alarmstate"     },
   },
   doors = {
-    { name = "Garage Office Door", param = "garagedoor"   },
+    { name = "Garage Office Door", param = "garagedoor"    },
   },
   inputs = {
     { name = "Hallway",            param = "security_zone1" },
     { name = "Lounge",             param = "security_zone2" },
   },
   outputs = {
-    { name = "CCTV",               param = "cctv_output"  },
+    { name = "CCTV",               param = "cctv_output"   },
   },
 }
 
 -- Named param constants — kept for backwards compatibility so that external
--- scripts (e.g. arm/disarm triggers) can reference param names without
--- hardcoding strings.
+-- scripts can reference param names without hardcoding strings.
 A.CBUS_USERPARAM_NAME_ALARMSTATE = "alarmstate"
 A.CBUS_USERPARAM_NAME_FRONTDOOR  = "frontdoor"
 A.CBUS_USERPARAM_NAME_REARDOOR   = "reardoor"
@@ -121,9 +165,8 @@ local FLAGS = {
   output = OUTPUT_FLAGS,
 }
 
--- Defines the long-poll subscription for each entity type.
--- Used both to build the monitor-updates payload and to map response IDs back
--- to entity types when processing state updates.
+-- Defines the long-poll subscription for each entity state type.
+-- Used to build the monitor-updates payload and map response IDs to types.
 local SUBSCRIPTIONS = {
   area   = { id = "CBUS-Areas-Monitor",  stateType = "AreaState"   },
   door   = { id = "CBUS-Doors-Monitor",  stateType = "DoorState"   },
@@ -131,7 +174,7 @@ local SUBSCRIPTIONS = {
   output = { id = "CBUS-Output-Monitor", stateType = "OutputState" },
 }
 
--- Maps summary response top-level keys to entity types.
+-- Maps summary response top-level JSON keys to entity types.
 local SUMMARY_KEYS = {
   area   = "Areas",
   door   = "Doors",
@@ -157,12 +200,12 @@ local ENTITY_TYPES = { "area", "door", "input", "output" }
 
 -- _entityMap is built dynamically by _discoverEntities() on the first poll.
 -- Each entry: { id (GUID), param (C-Bus user param name), type (entity type) }
--- Nil until discovery has completed successfully.
+-- Nil until discovery has completed; set to {} if discovery finds nothing.
 local _entityMap = nil
 
--- _areaIds maps area names → GUIDs, built during discovery.
--- Used by GetAreaId() so external scripts can look up area GUIDs by name.
-local _areaIds = {}
+-- _entityIds maps { type → { name → GUID } } for all discovered entities.
+-- Used by GetEntityId() so external scripts can look up GUIDs by friendly name.
+local _entityIds = {}
 
 -- timeSinceUpdate tokens returned by the Inception API with each response.
 -- Sent back on the next request so the server only returns events newer than
@@ -171,6 +214,15 @@ local _tsu = {}
 for _, t in ipairs(ENTITY_TYPES) do
   _tsu[SUBSCRIPTIONS[t].id] = "0"
 end
+
+-- LiveReviewEvents reference fields — updated after each received review event
+-- so the next request only returns events newer than the last received one.
+local _reviewReferenceId   = ""
+local _reviewReferenceTime = ""
+
+-- Tracks pending activity IDs awaiting progress results.
+-- Maps activityId → { label } so progress responses can be labelled in the log.
+local _pendingActivities = {}
 
 -- Consecutive API failure count and the earliest os.time() at which the next
 -- request is permitted. Both reset to 0 on any successful response.
@@ -297,7 +349,7 @@ local function Inception_Get(endpoint)
 
   local decoded = json.pdecode(body)
   if not decoded then
-    log("INCEPTION: GET failed to decode JSON response from " .. endpoint)
+    log("INCEPTION: GET failed to decode JSON from " .. endpoint)
     return nil
   end
 
@@ -347,16 +399,26 @@ end
 -- ENTITY DISCOVERY
 -- Called once on the first Resident_Poll cycle. Fetches summary data from the
 -- Inception API to:
---   1. Log all entity names visible to the API user (useful for configuring
+--   1. Log the system name and serial number.
+--   2. Log all entity names visible to the API user (useful for configuring
 --      MONITOR_CONFIG and diagnosing permission issues).
---   2. Match discovered entities by name against MONITOR_CONFIG and build
+--   3. Match discovered entities by name against MONITOR_CONFIG and build
 --      _entityMap with the resolved GUIDs.
---   3. Write each matched entity's current state to C-Bus immediately, so
+--   4. Write each matched entity's current state to C-Bus immediately, so
 --      params are populated before the first long-poll response arrives.
 -- =============================================================================
 
 local function _discoverEntities()
   local dbg = isDebuggingEnabled()
+
+  -- ── System info ─────────────────────────────────────────────────────────────
+  -- Log the system name and serial number so it is easy to confirm which
+  -- Inception controller the script is connected to.
+  local sysinfo = Inception_Get("api/v1/system-info")
+  if sysinfo then
+    log("INCEPTION: connected to '" .. tostring(sysinfo["SystemName"])
+        .. "' [S/N: " .. tostring(sysinfo["SerialNumber"]) .. "]")
+  end
 
   log("INCEPTION: starting entity discovery...")
 
@@ -370,8 +432,8 @@ local function _discoverEntities()
       local entities = summary[SUMMARY_KEYS[entityType]] or {}
 
       -- ── Log all available entities of this type ─────────────────────────────
-      -- This helps operators identify what names to use in MONITOR_CONFIG and
-      -- diagnose cases where the API user lacks permission to see certain items.
+      -- Helps operators identify names for MONITOR_CONFIG and diagnose cases
+      -- where the API user lacks permission to see certain items.
       local available = {}
       for _, entry in pairs(entities) do
         available[#available + 1] = entry["EntityInfo"]["Name"]
@@ -381,48 +443,51 @@ local function _discoverEntities()
         log("INCEPTION: available " .. entityType .. "s – "
             .. table.concat(available, ", "))
       else
-        log("INCEPTION: no " .. entityType
-            .. "s visible to this API user.")
+        log("INCEPTION: no " .. entityType .. "s visible to this API user.")
+      end
+
+      -- ── Build _entityIds lookup for this type ───────────────────────────────
+      -- Populated for all discovered entities (not just monitored ones) so that
+      -- GetEntityId() can resolve any entity for control scripts.
+      _entityIds[entityType] = _entityIds[entityType] or {}
+      for _, entry in pairs(entities) do
+        _entityIds[entityType][entry["EntityInfo"]["Name"]] = entry["EntityInfo"]["ID"]
       end
 
       -- ── Match MONITOR_CONFIG entries against discovered entities ────────────
       local configEntries = MONITOR_CONFIG[entityType .. "s"] or {}
       for _, cfg in ipairs(configEntries) do
-        local matched = false
-        for _, entry in pairs(entities) do
-          if entry["EntityInfo"]["Name"] == cfg.name then
-            local id    = entry["EntityInfo"]["ID"]
-            local state = entry["CurrentState"]
-
-            -- Store area GUIDs separately so GetAreaId() can look them up.
-            if entityType == "area" then
-              _areaIds[cfg.name] = id
-            end
-
-            -- Register this entity for long-poll state processing.
-            entityMap[#entityMap + 1] = {
-              id    = id,
-              param = cfg.param,
-              type  = entityType,
-            }
-
-            -- Write the current state to C-Bus immediately so params are
-            -- populated before the first long-poll response arrives.
-            local decoded = decodeBitmask(state, FLAGS[entityType])
-            safeSetUserParam(CBUS_NETWORK, cfg.param, decoded, dbg)
-
-            debuglog("INCEPTION: mapped " .. entityType .. " '" .. cfg.name
-                     .. "' → " .. cfg.param
-                     .. " (ID: " .. id .. ")"
-                     .. " initial state: " .. decoded, dbg)
-            matched = true
-            break
-          end
-        end
-        if not matched then
+        local id = _entityIds[entityType][cfg.name]
+        if not id then
           log("INCEPTION: WARNING – " .. entityType .. " '" .. cfg.name
               .. "' not found in Inception."
               .. " Check the name in MONITOR_CONFIG matches exactly.")
+        else
+          -- Retrieve CurrentState from the summary for the initial C-Bus write.
+          local state = 0
+          for _, entry in pairs(entities) do
+            if entry["EntityInfo"]["Name"] == cfg.name then
+              state = entry["CurrentState"] or 0
+              break
+            end
+          end
+
+          -- Register this entity for long-poll state processing.
+          entityMap[#entityMap + 1] = {
+            id    = id,
+            param = cfg.param,
+            type  = entityType,
+          }
+
+          -- Write the current state to C-Bus immediately so params are
+          -- populated before the first long-poll response arrives.
+          local decoded = decodeBitmask(state, FLAGS[entityType])
+          safeSetUserParam(CBUS_NETWORK, cfg.param, decoded, dbg)
+
+          debuglog("INCEPTION: mapped " .. entityType .. " '" .. cfg.name
+                   .. "' → " .. cfg.param
+                   .. " (ID: " .. id .. ")"
+                   .. " initial state: " .. decoded, dbg)
         end
       end
     end
@@ -434,25 +499,153 @@ local function _discoverEntities()
 end
 
 -- =============================================================================
+-- RESPONSE HANDLERS
+-- Private functions that process each type of long-poll response.
+-- =============================================================================
+
+-- Handles a MonitorEntityStates response — decodes updated entity states and
+-- writes them to their corresponding C-Bus user params.
+local function _handleEntityStates(result, dbg)
+  local responseId = tostring(result["ID"])
+  local resultData = result["Result"]
+
+  if not resultData then
+    log("INCEPTION: MonitorEntityStates response missing 'Result' field.")
+    return
+  end
+
+  -- Advance the timeSinceUpdate token so the next request fetches only newer events.
+  if _tsu[responseId] ~= nil then
+    _tsu[responseId] = tostring(resultData["updateTime"])
+  end
+
+  local stateData = resultData["stateData"]
+  if not stateData then return end
+
+  for i = 1, #stateData do
+    local entityId = stateData[i]["ID"]
+    for _, entry in ipairs(_entityMap) do
+      if entry.id == entityId then
+        local flagSet = FLAGS[entry.type]
+        if flagSet then
+          local status = decodeBitmask(stateData[i]["PublicState"], flagSet)
+          safeSetUserParam(CBUS_NETWORK, entry.param, status, dbg)
+          debuglog("INCEPTION: " .. entry.param .. " = " .. status, dbg)
+        end
+        break
+      end
+    end
+  end
+end
+
+-- Handles a LiveReviewEvents response — writes the most recent event description
+-- to REVIEW_EVENT_PARAM and advances the reference tokens for the next request.
+local function _handleReviewEvents(result, dbg)
+  local events = result["Result"]
+  if not events or #events == 0 then return end
+
+  -- The most recent event is the last entry (events are returned in ascending order).
+  local latest = events[#events]
+
+  -- Advance the reference tokens so the next request only returns newer events.
+  _reviewReferenceId   = tostring(latest["Id"]            or "")
+  _reviewReferenceTime = tostring(latest["ReferenceTime"] or latest["WhenTicks"] or "")
+
+  -- Build a readable label from description, who, and timestamp.
+  local description = tostring(latest["Description"] or "")
+  local when        = tostring(latest["When"]         or "")
+  local who         = tostring(latest["Who"]          or "")
+
+  local label = description
+  if who ~= "" and who ~= "nil" then
+    label = label .. " (" .. who .. ")"
+  end
+  if when ~= "" and when ~= "nil" then
+    label = label .. " @ " .. when
+  end
+
+  safeSetUserParam(CBUS_NETWORK, REVIEW_EVENT_PARAM, label, dbg)
+  debuglog("INCEPTION: review event – " .. label, dbg)
+
+  -- When debug is on, log every received event for full visibility.
+  if dbg then
+    for i = 1, #events do
+      local e = events[i]
+      log("INCEPTION: event – " .. tostring(e["Description"])
+          .. " | " .. tostring(e["When"])
+          .. " | who: " .. tostring(e["Who"]))
+    end
+  end
+end
+
+-- Handles an ActivityProgress response — logs the arm/disarm result and writes
+-- it to ALARM_DETAIL_PARAM. Removes the activity from _pendingActivities once
+-- it reaches a terminal state (Success or Failure).
+local function _handleActivityProgress(result, dbg)
+  local resultData = result["Result"]
+  if not resultData then return end
+
+  local actId   = tostring(resultData["ActivityId"] or "")
+  local pending = _pendingActivities[actId]
+  local msgs    = resultData["Messages"]
+  if not msgs or #msgs == 0 then return end
+
+  for i = 1, #msgs do
+    local msg   = msgs[i]
+    local state = msg["Type"]   -- 0=Running, 1=RunningNoCancel, 2=Success, 3=Failure
+    local text  = tostring(msg["Message"] or "")
+
+    if state == 2 then
+      -- Terminal: activity succeeded.
+      local label = "Success"
+      log("INCEPTION: activity " .. (pending and pending.label or actId)
+          .. " – Success")
+      safeSetUserParam(CBUS_NETWORK, ALARM_DETAIL_PARAM, label, dbg)
+      _pendingActivities[actId] = nil
+
+    elseif state == 3 then
+      -- Terminal: activity failed.
+      local label = "Failed: " .. text
+      log("INCEPTION: activity " .. (pending and pending.label or actId)
+          .. " – FAILED: " .. text)
+      safeSetUserParam(CBUS_NETWORK, ALARM_DETAIL_PARAM, label, dbg)
+      _pendingActivities[actId] = nil
+
+    else
+      -- Non-terminal: still running — log at debug level only.
+      debuglog("INCEPTION: activity " .. (pending and pending.label or actId)
+               .. " – in progress: " .. text, dbg)
+    end
+  end
+end
+
+-- =============================================================================
 -- PUBLIC API FUNCTIONS
 -- =============================================================================
 
--- Returns the Inception GUID for an area by its name, or nil if not found.
--- Populated during entity discovery. Use this in arm/disarm scripts instead
--- of hardcoding GUIDs:
---   inception.Control_Area(inception.GetAreaId("House"), "Arm")
-function A.GetAreaId(name)
-  local id = _areaIds[name]
+-- Returns the Inception GUID for any entity by type and name.
+-- Populated during entity discovery on the first Resident_Poll call.
+-- Use in control scripts instead of hardcoding GUIDs:
+--   inception.Control_Area(inception.GetEntityId("area", "House"), "Arm")
+--   inception.Control_Door(inception.GetEntityId("door", "Garage Office Door"), "Open")
+function A.GetEntityId(entityType, name)
+  local typeMap = _entityIds[entityType]
+  if not typeMap then
+    log("INCEPTION: GetEntityId – unknown entity type '" .. tostring(entityType)
+        .. "'. Has discovery run yet?")
+    return nil
+  end
+  local id = typeMap[name]
   if not id then
-    log("INCEPTION: GetAreaId – area '" .. name
-        .. "' not found. Has discovery run yet?")
+    log("INCEPTION: GetEntityId – " .. tostring(entityType) .. " '"
+        .. tostring(name) .. "' not found. Has discovery run yet?")
   end
   return id
 end
 
--- Arms or disarms an alarm area.
--- id      : area GUID — use inception.GetAreaId("name") to look up by name.
--- C_type  : one of "Disarm", "Arm", "ArmStay", "ArmSleep"
+-- Arms or disarms an alarm area and registers the activity for progress monitoring.
+-- id     : area GUID — use inception.GetEntityId("area", "House")
+-- C_type : "Disarm", "Arm", "ArmStay", or "ArmSleep"
 function A.Control_Area(id, C_type)
   if not id then
     log("INCEPTION: Control_Area called with nil id – ignoring.")
@@ -467,14 +660,130 @@ function A.Control_Area(id, C_type)
     ExitDelay       = true,
   })
 
-  local res = A.Inception_Post(payload, "control/area/" .. id .. "/activity")
-  if res then
-    log("INCEPTION: Area Control – " .. tostring(C_type)
-        .. " – Response: " .. res)
-  else
-    log("INCEPTION: Area Control – " .. tostring(C_type) .. " – no response")
+  local body = A.Inception_Post(payload, "control/area/" .. id .. "/activity")
+  if not body then
+    log("INCEPTION: Control_Area – " .. tostring(C_type) .. " – no response")
+    return nil
   end
-  return res
+
+  -- Decode the ActivityResponse to get the result and the new activity ID.
+  -- The activity ID is registered for progress monitoring via the long-poll.
+  local response = json.pdecode(body)
+  if not response then
+    log("INCEPTION: Control_Area – could not decode response")
+    return nil
+  end
+
+  local result  = response["Response"] and response["Response"]["Result"]  or "Unknown"
+  local message = response["Response"] and response["Response"]["Message"] or ""
+  local actId   = response["ActivityID"]
+
+  if result == "Success" then
+    log("INCEPTION: Control_Area – " .. tostring(C_type) .. " – accepted"
+        .. (actId and (" (activity: " .. actId .. ")") or ""))
+    -- Register for progress monitoring so arm success/failure is fed back to C-Bus.
+    if actId then
+      _pendingActivities[actId] = { label = C_type }
+    end
+  else
+    log("INCEPTION: Control_Area – " .. tostring(C_type)
+        .. " – FAILED: " .. message)
+    safeSetUserParam(CBUS_NETWORK, ALARM_DETAIL_PARAM,
+                     "Failed: " .. message, isDebuggingEnabled())
+  end
+
+  return response
+end
+
+-- Controls a door.
+-- id       : door GUID — use inception.GetEntityId("door", "Garage Office Door")
+-- C_type   : "Lock", "Unlock", "Open", "TimedUnlock", "Lockout",
+--            "Reinstate", "ToggleLock", "MuteHeldResponse", "CancelAccessRequests"
+-- timeSecs : (optional) duration in seconds for timed operations e.g. TimedUnlock
+function A.Control_Door(id, C_type, timeSecs)
+  if not id then
+    log("INCEPTION: Control_Door called with nil id – ignoring.")
+    return nil
+  end
+
+  local json    = require("json")
+  local payload = { Type = "ControlDoor", DoorControlType = C_type, Entity = id }
+  if timeSecs then payload["TimeSecs"] = timeSecs end
+
+  local body = A.Inception_Post(json.encode(payload),
+                                "control/door/" .. id .. "/activity")
+  if not body then
+    log("INCEPTION: Control_Door – " .. tostring(C_type) .. " – no response")
+    return nil
+  end
+
+  local response = json.pdecode(body)
+  if not response then
+    log("INCEPTION: Control_Door – could not decode response")
+    return nil
+  end
+
+  local result  = response["Response"] and response["Response"]["Result"]  or "Unknown"
+  local message = response["Response"] and response["Response"]["Message"] or ""
+
+  if result == "Success" then
+    log("INCEPTION: Control_Door – " .. tostring(C_type) .. " – accepted")
+  else
+    log("INCEPTION: Control_Door – " .. tostring(C_type)
+        .. " – FAILED: " .. message)
+  end
+
+  return response
+end
+
+-- Controls an output.
+-- id       : output GUID — use inception.GetEntityId("output", "CCTV")
+-- C_type   : "On", "Off", "Toggle", or "Pulse"
+-- timeSecs : (optional) duration in seconds — output returns to previous state
+--            after this time. Applicable to On and Pulse.
+function A.Control_Output(id, C_type, timeSecs)
+  if not id then
+    log("INCEPTION: Control_Output called with nil id – ignoring.")
+    return nil
+  end
+
+  local json    = require("json")
+  local payload = { Type = "ControlOutput", OutputControlType = C_type, Entity = id }
+  if timeSecs then payload["TimeSecs"] = timeSecs end
+
+  local body = A.Inception_Post(json.encode(payload),
+                                "control/output/" .. id .. "/activity")
+  if not body then
+    log("INCEPTION: Control_Output – " .. tostring(C_type) .. " – no response")
+    return nil
+  end
+
+  local response = json.pdecode(body)
+  if not response then
+    log("INCEPTION: Control_Output – could not decode response")
+    return nil
+  end
+
+  local result  = response["Response"] and response["Response"]["Result"]  or "Unknown"
+  local message = response["Response"] and response["Response"]["Message"] or ""
+
+  if result == "Success" then
+    log("INCEPTION: Control_Output – " .. tostring(C_type) .. " – accepted")
+  else
+    log("INCEPTION: Control_Output – " .. tostring(C_type)
+        .. " – FAILED: " .. message)
+  end
+
+  return response
+end
+
+-- Clears the entity map and re-runs discovery on the next poll cycle.
+-- Call from a C-Bus event script when the Inception system has been reconfigured
+-- (e.g. new zones added, entities renamed) without restarting the resident script.
+function A.ResetDiscovery()
+  log("INCEPTION: ResetDiscovery called – will re-discover on next poll.")
+  _entityMap = nil
+  _entityIds = {}
 end
 
 -- Decodes an AreaPublicStates bitmask into a readable state string.
@@ -498,14 +807,13 @@ function A.Resident_Poll()
   local dbg = isDebuggingEnabled()
 
   -- ── Entity discovery ────────────────────────────────────────────────────────
-  -- Runs once on the first call. Populates _entityMap with resolved GUIDs and
-  -- writes initial state values to C-Bus. On subsequent calls this is a no-op.
+  -- Runs once on the first call. Logs system info and available entities,
+  -- resolves MONITOR_CONFIG names to GUIDs, and writes initial state to C-Bus.
+  -- On subsequent calls this block is a no-op.
   if _entityMap == nil then
     _entityMap = _discoverEntities()
     if #_entityMap == 0 then
       log("INCEPTION: no entities matched MONITOR_CONFIG – check configuration.")
-      -- Leave _entityMap as an empty table (not nil) so discovery does not
-      -- re-run on every tick if nothing is configured.
     end
   end
 
@@ -521,10 +829,12 @@ function A.Resident_Poll()
   local json = require("json")
 
   -- ── Build long-poll payload ─────────────────────────────────────────────────
-  -- Subscribe to state changes for all four entity types in a single request.
-  -- SUBSCRIPTIONS drives the payload so adding a new entity type only requires
-  -- updating that table. timeSinceUpdate tokens ensure only new events return.
+  -- Subscribe to entity state changes, live review events, and any pending
+  -- activity progress updates — all in a single long-poll request.
   local subscriptions = {}
+
+  -- Entity state subscriptions (area, door, input, output).
+  -- Driven by SUBSCRIPTIONS table so no changes needed here when adding types.
   for _, entityType in ipairs(ENTITY_TYPES) do
     local sub = SUBSCRIPTIONS[entityType]
     subscriptions[#subscriptions + 1] = {
@@ -534,54 +844,57 @@ function A.Resident_Poll()
     }
   end
 
+  -- Live review events — streams security and access events in real time.
+  subscriptions[#subscriptions + 1] = {
+    ID          = "CBUS-Review-Monitor",
+    RequestType = "LiveReviewEvents",
+    InputData   = {
+      referenceId    = _reviewReferenceId,
+      referenceTime  = _reviewReferenceTime,
+      categoryFilter = REVIEW_CATEGORIES,
+    },
+  }
+
+  -- Activity progress — one subscription per pending arm/disarm activity.
+  for actId, info in pairs(_pendingActivities) do
+    subscriptions[#subscriptions + 1] = {
+      ID          = "CBUS-Activity-" .. actId,
+      RequestType = "ActivityProgress",
+      InputData   = { activityId = actId, receivedMsgs = "" },
+    }
+    debuglog("INCEPTION: monitoring progress for activity "
+             .. info.label .. " (" .. actId .. ")", dbg)
+  end
+
   local payload = json.encode(subscriptions)
 
   -- ── Poll the API ────────────────────────────────────────────────────────────
-  -- Blocks for up to HTTP_TIMEOUT_LONGPOLL seconds waiting for a state change.
+  -- Blocks for up to HTTP_TIMEOUT_LONGPOLL seconds waiting for any event.
   -- Returns nil if nothing changed (normal) or on error (backoff applied).
   local body = A.Inception_Post(payload, "monitor-updates")
   if isempty(body) then return end
 
-  -- ── Parse response ──────────────────────────────────────────────────────────
+  -- ── Parse and dispatch response ─────────────────────────────────────────────
+  -- The API returns one UpdateMonitorRequestResult per poll response.
+  -- Dispatch to the appropriate handler based on the subscription ID.
   local result = json.pdecode(body)
   if not result then
     log("INCEPTION: failed to decode monitor-updates response – skipping.")
     return
   end
 
-  local responseId = tostring(result["ID"])
-  local resultData = result["Result"]
+  local responseId = tostring(result["ID"] or "")
 
-  if not resultData then
-    log("INCEPTION: monitor-updates response missing 'Result' field – skipping.")
-    return
-  end
+  if responseId == "CBUS-Review-Monitor" then
+    _handleReviewEvents(result, dbg)
 
-  local stateData = resultData["stateData"]
+  elseif responseId:find("^CBUS%-Activity%-") then
+    _handleActivityProgress(result, dbg)
 
-  -- Advance the timeSinceUpdate token for this subscription so the next
-  -- request only fetches events that are newer than this response.
-  if _tsu[responseId] ~= nil then
-    _tsu[responseId] = tostring(resultData["updateTime"])
-  end
+  elseif result["Result"] and result["Result"]["stateData"] then
+    _handleEntityStates(result, dbg)
 
-  -- ── Write state to C-Bus ────────────────────────────────────────────────────
-  -- For each entity update in the response, find its _entityMap entry and
-  -- write the decoded state string to the corresponding C-Bus user param.
-  if not stateData then return end
-
-  for i = 1, #stateData do
-    local entityId = stateData[i]["ID"]
-    for _, entry in ipairs(_entityMap) do
-      if entry.id == entityId then
-        local flagSet = FLAGS[entry.type]
-        if flagSet then
-          local status = decodeBitmask(stateData[i]["PublicState"], flagSet)
-          safeSetUserParam(CBUS_NETWORK, entry.param, status, dbg)
-          debuglog("INCEPTION: " .. entry.param .. " = " .. status, dbg)
-        end
-        break
-      end
-    end
+  else
+    debuglog("INCEPTION: unhandled response ID: " .. responseId, dbg)
   end
 end
