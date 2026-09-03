@@ -1,5 +1,5 @@
 -- Integrates the Inner Range Inception alarm system with C-Bus.
--- Provides long-poll state monitoring (areas, doors, inputs/zones) and
+-- Provides long-poll state monitoring (areas, doors, inputs/zones, outputs) and
 -- area arm/disarm control via the Inception REST API.
 --
 -- Resident script usage:
@@ -22,9 +22,12 @@ inception = A
 local API_ROOT  = secrets.API_ROOT
 local api_token = secrets.api_token
 
--- HTTP timeout in seconds for Inception API calls.
--- The long-poll endpoint holds for up to 60 s; allow a small buffer.
-local HTTP_TIMEOUT = 61
+-- HTTP timeout in seconds for standard (non-long-poll) requests.
+local HTTP_TIMEOUT = 10
+
+-- HTTP timeout in seconds for the long-poll monitor-updates request.
+-- The server holds the connection for up to 60 s waiting for events.
+local HTTP_TIMEOUT_LONGPOLL = 61
 
 -- C-Bus network name that owns all Inception user params.
 local CBUS_NETWORK = "Ethernet"
@@ -39,31 +42,29 @@ local DEBUG_PARAM = "Debug Logging"
 local BACKOFF_DELAYS = { 30, 60, 120, 300 }
 
 -- =============================================================================
--- ENTITY MAP
--- Maps each monitored Inception entity to its C-Bus user param and state type.
+-- MONITOR CONFIG
+-- Defines which Inception entities to monitor and which C-Bus user params to
+-- write their decoded state into. Entities are matched by name against the
+-- Inception system at startup — no GUIDs required here.
+--
 -- To add or remove a monitored entity, edit only this table.
+-- Names must match exactly what is configured in the Inception system.
 -- =============================================================================
 
--- Each entry:
---   id    : Inception entity GUID (from secrets)
---   param : C-Bus user param name to write the decoded state string into
---   type  : "area" | "door" | "input" — selects the bitmask decoder
-
-local ENTITY_MAP = {
-  -- Alarm area
-  { id = secrets.area_id,       param = "alarmstate",     type = "area"  },
-  -- Doors
-  { id = secrets.front_door_id, param = "frontdoor",      type = "door"  },
-  { id = secrets.rear_door_id,  param = "reardoor",       type = "door"  },
-  -- Zones / inputs
-  { id = secrets.zone1,         param = "security_zone1", type = "input" },
-  { id = secrets.zone2,         param = "security_zone2", type = "input" },
-  { id = secrets.zone3,         param = "security_zone3", type = "input" },
-  { id = secrets.zone4,         param = "security_zone4", type = "input" },
-  { id = secrets.zone5,         param = "security_zone5", type = "input" },
-  { id = secrets.zone6,         param = "security_zone6", type = "input" },
-  { id = secrets.zone7,         param = "security_zone7", type = "input" },
-  { id = secrets.zone8,         param = "security_zone8", type = "input" },
+local MONITOR_CONFIG = {
+  areas = {
+    { name = "House",   param = "alarmstate"  },
+  },
+  doors = {
+    { name = "Garage Office Door", param = "garagedoor" },
+  },
+  inputs = {
+    { name = "Hallway", param = "security_zone1" },
+    { name = "Lounge",  param = "security_zone2" },
+  },
+  outputs = {
+    { name = "CCTV",    param = "cctv_output"  },
+  },
 }
 
 -- Named param constants — kept for backwards compatibility so that external
@@ -80,8 +81,7 @@ A.CBUS_USERPARAM_NAME_ZONES = {
 -- LOOKUP TABLES
 -- Static bitmask label arrays for each entity type.
 -- Bit position 0 (value 1) maps to index 1, bit 1 (value 2) to index 2, etc.
--- Values match the Inception REST API AreaPublicStates / DoorPublicStates /
--- InputPublicStates enumerations.
+-- Values match the Inception REST API *PublicStates enumerations.
 -- =============================================================================
 
 local AREA_FLAGS = {
@@ -101,17 +101,61 @@ local INPUT_FLAGS = {
   "Sealed", "Wireless Door Battery Low", "Wireless Door Lock Offline",
 }
 
+local OUTPUT_FLAGS = {
+  "On", "Off",
+}
+
+-- Maps entity type strings to their flag arrays.
+local FLAGS = {
+  area   = AREA_FLAGS,
+  door   = DOOR_FLAGS,
+  input  = INPUT_FLAGS,
+  output = OUTPUT_FLAGS,
+}
+
+-- Maps entity type strings to the long-poll subscription IDs and state types.
+local MONITOR_SUBSCRIPTIONS = {
+  area   = { id = "CBUS-Areas-Monitor",   stateType = "AreaState"   },
+  door   = { id = "CBUS-Doors-Monitor",   stateType = "DoorState"   },
+  input  = { id = "CBUS-Input-Monitor",   stateType = "InputState"  },
+  output = { id = "CBUS-Output-Monitor",  stateType = "OutputState" },
+}
+
+-- Maps the Inception summary response top-level keys to entity types.
+local SUMMARY_KEYS = {
+  area   = "Areas",
+  door   = "Doors",
+  input  = "Inputs",
+  output = "Outputs",
+}
+
+-- Maps the Inception summary endpoints to entity types.
+local SUMMARY_ENDPOINTS = {
+  area   = "control/area/summary",
+  door   = "control/door/summary",
+  input  = "control/input/summary",
+  output = "control/output/summary",
+}
+
 -- =============================================================================
 -- MODULE STATE
 -- Variables that persist between poll cycles.
 -- =============================================================================
 
+-- ENTITY_MAP is built dynamically at startup by _discoverEntities().
+-- Each entry: { id, param, type }
+-- Nil until discovery completes; Resident_Poll will trigger discovery on first call.
+local _entityMap = nil
+
 -- timeSinceUpdate tokens returned by the Inception API after each response.
 -- Sent back on the next request so the server only returns events that are
 -- newer than the last received update. "0" requests the full current state.
-local _tsuArea   = "0"
-local _tsuDoors  = "0"
-local _tsuInputs = "0"
+local _tsu = {
+  ["CBUS-Areas-Monitor"]  = "0",
+  ["CBUS-Doors-Monitor"]  = "0",
+  ["CBUS-Input-Monitor"]  = "0",
+  ["CBUS-Output-Monitor"] = "0",
+}
 
 -- Consecutive failure count and the earliest os.time() at which the next
 -- request is permitted. Both reset to 0 after any successful response.
@@ -210,6 +254,31 @@ end
 -- HTTP FUNCTIONS
 -- =============================================================================
 
+-- Sends a GET request to the Inception REST API.
+-- Returns the raw response body string on success, or nil on error.
+local function Inception_Get(endpoint)
+  local http = require("socket.http")
+  http.TIMEOUT = HTTP_TIMEOUT
+
+  local body, code, _, status = http.request {
+    method  = "GET",
+    url     = API_ROOT .. "/" .. endpoint,
+    headers = {
+      ["Accept"]        = "application/json",
+      ["Authorization"] = "APIToken " .. api_token,
+    },
+  }
+
+  if code ~= 200 then
+    log("INCEPTION: GET error " .. tostring(code) .. " – " .. tostring(body))
+    return nil
+  elseif isempty(body) then
+    return nil
+  else
+    return body
+  end
+end
+
 -- Sends a POST request to the Inception REST API.
 -- Returns the raw response body string on success.
 -- Returns nil on HTTP error (logs the error and triggers backoff) or when the
@@ -217,7 +286,7 @@ end
 function A.Inception_Post(payload, endpoint)
   local http = require("socket.http")
   local dbg  = isDebuggingEnabled()
-  http.TIMEOUT = HTTP_TIMEOUT
+  http.TIMEOUT = HTTP_TIMEOUT_LONGPOLL
 
   local body, code, _, status = http.request {
     method  = "POST",
@@ -249,6 +318,81 @@ function A.Inception_Post(payload, endpoint)
 end
 
 -- =============================================================================
+-- ENTITY DISCOVERY
+-- Fetches summary data from Inception at startup to:
+--   1. Log all available entity names so the operator can see what is discoverable.
+--   2. Match entities by name against MONITOR_CONFIG and build _entityMap.
+--   3. Write the current state of each matched entity to C-Bus immediately,
+--      so params are populated before the first long-poll response arrives.
+-- =============================================================================
+
+local function _discoverEntities()
+  local json = require("json")
+  local dbg  = isDebuggingEnabled()
+
+  log("INCEPTION: starting entity discovery...")
+
+  local entityMap = {}
+  local types = { "area", "door", "input", "output" }
+
+  for _, entityType in ipairs(types) do
+    local body = Inception_Get(SUMMARY_ENDPOINTS[entityType])
+    if not body then
+      log("INCEPTION: could not fetch " .. entityType .. " summary – skipping.")
+    else
+      local summary  = json.decode(body)
+      local topKey   = SUMMARY_KEYS[entityType]
+      local entities = summary[topKey] or {}
+
+      -- ── Log all available entities of this type ─────────────────────────────
+      local available = {}
+      for _, entry in pairs(entities) do
+        available[#available + 1] = entry["EntityInfo"]["Name"]
+      end
+      table.sort(available)
+      if #available > 0 then
+        log("INCEPTION: available " .. entityType .. "s – " .. table.concat(available, ", "))
+      else
+        log("INCEPTION: no " .. entityType .. "s visible to this API user.")
+      end
+
+      -- ── Match against MONITOR_CONFIG and build entityMap entries ────────────
+      local configEntries = MONITOR_CONFIG[entityType .. "s"] or {}
+      for _, cfg in ipairs(configEntries) do
+        local matched = false
+        for _, entry in pairs(entities) do
+          if entry["EntityInfo"]["Name"] == cfg.name then
+            local id    = entry["EntityInfo"]["ID"]
+            local state = entry["CurrentState"]
+
+            -- Add to the entity map for long-poll processing.
+            entityMap[#entityMap + 1] = { id = id, param = cfg.param, type = entityType }
+
+            -- Write the current state to C-Bus immediately so params are
+            -- populated before the first long-poll response arrives.
+            local decoded = decodeBitmask(state, FLAGS[entityType])
+            safeSetUserParam(CBUS_NETWORK, cfg.param, decoded, dbg)
+
+            debuglog("INCEPTION: mapped " .. entityType .. " '" .. cfg.name
+                     .. "' → " .. cfg.param .. " (ID: " .. id .. ")"
+                     .. " current state: " .. decoded, dbg)
+            matched = true
+            break
+          end
+        end
+        if not matched then
+          log("INCEPTION: " .. entityType .. " '" .. cfg.name
+              .. "' not found in Inception – check name in MONITOR_CONFIG.")
+        end
+      end
+    end
+  end
+
+  log("INCEPTION: discovery complete – monitoring " .. #entityMap .. " entity/entities.")
+  return entityMap
+end
+
+-- =============================================================================
 -- PUBLIC API FUNCTIONS
 -- =============================================================================
 
@@ -273,27 +417,16 @@ function A.Control_Area(id, C_type)
 end
 
 -- Decodes an AreaPublicStates bitmask into a readable state string.
-function A.areaeval(res)
-  return decodeBitmask(res, AREA_FLAGS)
-end
+function A.areaeval(res)  return decodeBitmask(res, AREA_FLAGS)  end
 
 -- Decodes a DoorPublicStates bitmask into a readable state string.
-function A.dooreval(res)
-  return decodeBitmask(res, DOOR_FLAGS)
-end
+function A.dooreval(res)  return decodeBitmask(res, DOOR_FLAGS)  end
 
 -- Decodes an InputPublicStates bitmask into a readable state string.
-function A.inputeval(res)
-  return decodeBitmask(res, INPUT_FLAGS)
-end
+function A.inputeval(res) return decodeBitmask(res, INPUT_FLAGS) end
 
--- Maps entity type strings to their decoder functions.
--- Used by Resident_Poll to look up the correct decoder for each ENTITY_MAP entry.
-local EVAL_FN = {
-  area  = A.areaeval,
-  door  = A.dooreval,
-  input = A.inputeval,
-}
+-- Decodes an OutputPublicStates bitmask into a readable state string.
+function A.outputeval(res) return decodeBitmask(res, OUTPUT_FLAGS) end
 
 -- =============================================================================
 -- RESIDENT POLL
@@ -302,6 +435,16 @@ local EVAL_FN = {
 
 function A.Resident_Poll()
   local dbg = isDebuggingEnabled()
+
+  -- ── Entity discovery ────────────────────────────────────────────────────────
+  -- Runs once on the first poll cycle. Fetches summaries, logs available
+  -- entities, resolves MONITOR_CONFIG names to GUIDs, and writes initial state.
+  if _entityMap == nil then
+    _entityMap = _discoverEntities()
+    if #_entityMap == 0 then
+      log("INCEPTION: no entities matched MONITOR_CONFIG – check configuration.")
+    end
+  end
 
   -- ── Backoff check ───────────────────────────────────────────────────────────
   -- If a previous request failed, skip polling until the backoff window expires.
@@ -314,29 +457,34 @@ function A.Resident_Poll()
   local json = require("json")
 
   -- ── Build long-poll payload ─────────────────────────────────────────────────
-  -- Subscribe to area, door and input state changes in a single request.
+  -- Subscribe to area, door, input and output state changes in a single request.
   -- The timeSinceUpdate tokens ensure the server only returns events newer
   -- than the last update received for each subscription.
   local payload = json.encode({
     {
       ID          = "CBUS-Areas-Monitor",
       RequestType = "MonitorEntityStates",
-      InputData   = { stateType = "AreaState",  timeSinceUpdate = _tsuArea   },
+      InputData   = { stateType = "AreaState",   timeSinceUpdate = _tsu["CBUS-Areas-Monitor"]  },
     },
     {
       ID          = "CBUS-Doors-Monitor",
       RequestType = "MonitorEntityStates",
-      InputData   = { stateType = "DoorState",  timeSinceUpdate = _tsuDoors  },
+      InputData   = { stateType = "DoorState",   timeSinceUpdate = _tsu["CBUS-Doors-Monitor"]  },
     },
     {
       ID          = "CBUS-Input-Monitor",
       RequestType = "MonitorEntityStates",
-      InputData   = { stateType = "InputState", timeSinceUpdate = _tsuInputs },
+      InputData   = { stateType = "InputState",  timeSinceUpdate = _tsu["CBUS-Input-Monitor"]  },
+    },
+    {
+      ID          = "CBUS-Output-Monitor",
+      RequestType = "MonitorEntityStates",
+      InputData   = { stateType = "OutputState", timeSinceUpdate = _tsu["CBUS-Output-Monitor"] },
     },
   })
 
   -- ── Poll the API ────────────────────────────────────────────────────────────
-  -- Blocks for up to HTTP_TIMEOUT seconds waiting for a state change event.
+  -- Blocks for up to HTTP_TIMEOUT_LONGPOLL seconds waiting for a state change.
   -- Returns nil if nothing changed (normal) or on error (backoff applied).
   local body = A.Inception_Post(payload, "monitor-updates")
   if isempty(body) then return end
@@ -347,21 +495,20 @@ function A.Resident_Poll()
   local stateData  = result["Result"]["stateData"]
 
   -- Advance the timeSinceUpdate token so the next request only fetches newer events.
-  if     responseId == "CBUS-Areas-Monitor" then _tsuArea   = tostring(result["Result"]["updateTime"])
-  elseif responseId == "CBUS-Doors-Monitor" then _tsuDoors  = tostring(result["Result"]["updateTime"])
-  elseif responseId == "CBUS-Input-Monitor" then _tsuInputs = tostring(result["Result"]["updateTime"])
+  if _tsu[responseId] ~= nil then
+    _tsu[responseId] = tostring(result["Result"]["updateTime"])
   end
 
   -- ── Write state to C-Bus ────────────────────────────────────────────────────
-  -- For each updated entity in the response, find its ENTITY_MAP entry and
+  -- For each updated entity in the response, find its _entityMap entry and
   -- write the decoded state string to the corresponding C-Bus user param.
   for i = 1, #stateData do
     local entityId = stateData[i]["ID"]
-    for _, entry in ipairs(ENTITY_MAP) do
+    for _, entry in ipairs(_entityMap) do
       if entry.id == entityId then
-        local evalFn = EVAL_FN[entry.type]
-        if evalFn then
-          local status = evalFn(stateData[i]["PublicState"])
+        local flagSet = FLAGS[entry.type]
+        if flagSet then
+          local status = decodeBitmask(stateData[i]["PublicState"], flagSet)
           safeSetUserParam(CBUS_NETWORK, entry.param, status, dbg)
           debuglog("INCEPTION: " .. entry.param .. " = " .. status, dbg)
         end
