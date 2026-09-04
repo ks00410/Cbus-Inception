@@ -44,7 +44,10 @@
 --   matching user params in C-Bus with the same names.
 -- =============================================================================
 
-require("user.secrets")
+local ok_sec, sec_mod = pcall(require, "user.secrets")
+if not ok_sec then
+  pcall(require, "secrets")
+end
 
 -- inception is the public module table, registered as a global so C-Bus can
 -- call inception.Resident_Poll() and control functions from any script.
@@ -52,13 +55,20 @@ local A = {}
 inception = A
 
 -- =============================================================================
--- CONFIGURATION
--- All tuneable values are in this section. Edit here; do not change code below.
+-- CONFIGURATION & DEFAULTS
 -- =============================================================================
 
--- Inception REST API base URL and API token — loaded from the secrets library.
-local API_ROOT  = secrets.API_ROOT
-local api_token = secrets.api_token
+-- Inception REST API base URL and API token helper
+local function getSecrets()
+  if type(secrets) == "table" then
+    if secrets.inception and type(secrets.inception) == "table" then
+      return secrets.inception.API_ROOT or secrets.API_ROOT,
+             secrets.inception.api_token or secrets.api_token
+    end
+    return secrets.API_ROOT, secrets.api_token
+  end
+  return nil, nil
+end
 
 -- HTTP timeout in seconds for standard (non-long-poll) GET requests.
 local HTTP_TIMEOUT = 10
@@ -68,18 +78,17 @@ local HTTP_TIMEOUT = 10
 -- allow a small buffer to avoid premature client-side timeouts.
 local HTTP_TIMEOUT_LONGPOLL = 61
 
--- C-Bus network name that owns all Inception user parameters.
-local CBUS_NETWORK = "Ethernet"
+-- Default C-Bus network name that owns all Inception user parameters.
+local DEFAULT_CBUS_NETWORK = "Ethernet"
 
--- Name of the C-Bus user param used as a debug-logging toggle.
--- Set it to true/1 in the C-Bus project to enable verbose logging.
-local DEBUG_PARAM = "Debug Logging"
+-- Default name of the C-Bus user param used as a debug-logging toggle.
+local DEFAULT_DEBUG_PARAM = "Debug Logging"
 
--- C-Bus user param that receives the most recent security/access review event.
-local REVIEW_EVENT_PARAM = "last_alarm_event"
+-- Default C-Bus user param that receives the most recent security/access review event.
+local DEFAULT_REVIEW_EVENT_PARAM = "last_alarm_event"
 
--- C-Bus user param that receives the result of the last area arm/disarm activity.
-local ALARM_DETAIL_PARAM = "alarmstate_detail"
+-- Default C-Bus user param that receives the result of the last area arm/disarm activity.
+local DEFAULT_ALARM_DETAIL_PARAM = "alarmstate_detail"
 
 -- Review event categories to subscribe to via LiveReviewEvents.
 -- Accepted values: "System", "Audit", "Access", "Security", "Hardware"
@@ -90,18 +99,8 @@ local REVIEW_CATEGORIES = "Security,Access"
 -- 1st failure → 30 s, 2nd → 60 s, 3rd → 120 s, 4th+ → 300 s (5 min).
 local BACKOFF_DELAYS = { 30, 60, 120, 300 }
 
--- =============================================================================
--- MONITOR CONFIG
--- Defines which Inception entities to monitor and which C-Bus user params to
--- write their decoded state into. Entities are matched by name against the
--- Inception system at startup — no GUIDs required here.
---
--- To add or remove a monitored entity, edit only this table.
--- Names must match exactly what is configured in the Inception system.
--- A matching String user param must exist in C-Bus for each "param" value.
--- =============================================================================
-
-local MONITOR_CONFIG = {
+-- Default monitored entities if not provided in resident script config table.
+local DEFAULT_MONITOR_CONFIG = {
   areas = {
     { name = "House",              param = "alarmstate"     },
   },
@@ -237,15 +236,19 @@ local _missingParamWarned = {}
 -- LOGGING HELPERS
 -- =============================================================================
 
--- Returns true if the "Debug Logging" C-Bus user param is set to a truthy value.
-local function isDebuggingEnabled()
-  return toboolean(GetUserParam(0, DEBUG_PARAM))
+-- Returns true if explicit_debug is true or if the C-Bus user param evaluates directly to boolean true.
+local function isDebuggingEnabled(network, custom_debug_param, explicit_debug)
+  if explicit_debug == true then return true end
+  local net = network or DEFAULT_CBUS_NETWORK
+  local param_name = custom_debug_param or DEFAULT_DEBUG_PARAM
+  local ok, val = pcall(GetUserParam, net, param_name)
+  return ok and val == true
 end
 
 -- Writes str to the C-Bus log only when debugEnabled is true.
 -- Always pass the cached dbg flag — never call isDebuggingEnabled() per-write.
 local function debuglog(str, debugEnabled)
-  if debugEnabled then log(str) end
+  if debugEnabled then log("INCEPTION [DEBUG]: " .. tostring(str)) end
 end
 
 -- =============================================================================
@@ -253,6 +256,12 @@ end
 -- =============================================================================
 -- GetUserParam and SetUserParam raise hard Lua errors for params that do not
 -- exist in the C-Bus project. Both helpers use pcall to handle this safely.
+
+-- Reads a user param. Returns the value on success, or nil on error.
+local function safeGetUserParam(network, name)
+  local ok, val = pcall(GetUserParam, network, name)
+  return ok and val or nil
+end
 
 -- Writes a value to a user param.
 -- Silently does nothing if value is nil or empty.
@@ -262,13 +271,23 @@ local function safeSetUserParam(network, name, value, debugEnabled)
   if value == nil or value == "" then return end
   local ok = pcall(SetUserParam, network, name, value)
   if not ok then
-    local key = network .. ":" .. name
+    local key = tostring(network) .. ":" .. tostring(name)
     if debugEnabled or not _missingParamWarned[key] then
-      log("INCEPTION: UserParam '" .. name .. "' does not exist on network '"
-          .. network .. "' – skipping write")
+      log("INCEPTION: UserParam '" .. tostring(name) .. "' does not exist on network '"
+          .. tostring(network) .. "' – skipping write")
       _missingParamWarned[key] = true
     end
   end
+end
+
+-- Resolve C-Bus UserParam name (checks config.cbus_params overrides first, then falls back to prefix or default)
+local function getParamName(config, attr, default_suffix)
+  local params = config and config.cbus_params or {}
+  if params[attr] and type(params[attr]) == "string" and #params[attr] > 0 then
+    return params[attr]
+  end
+  local pfx = (config and config.param_prefix) or ""
+  return pfx .. (default_suffix or attr)
 end
 
 -- =============================================================================
@@ -324,14 +343,23 @@ end
 
 -- Sends a GET request to the Inception REST API.
 -- Returns the decoded JSON table on success, or nil on HTTP error or bad JSON.
-local function Inception_Get(endpoint)
+local function Inception_Get(endpoint, api_root_override, token_override)
   local http = require("socket.http")
   local json = require("json")
   http.TIMEOUT = HTTP_TIMEOUT
 
+  local api_root, api_token = getSecrets()
+  api_root = api_root_override or api_root
+  api_token = token_override or api_token
+
+  if not api_root or not api_token then
+    log("INCEPTION: Missing API_ROOT or api_token in secrets or configuration.")
+    return nil
+  end
+
   local body, code, _, status = http.request {
     method  = "GET",
-    url     = API_ROOT .. "/" .. endpoint,
+    url     = api_root .. "/" .. endpoint,
     headers = {
       ["Accept"]        = "application/json",
       ["Authorization"] = "APIToken " .. api_token,
@@ -360,14 +388,22 @@ end
 -- Returns the raw response body string on success.
 -- Returns nil on HTTP error (triggers backoff) or empty body (normal long-poll
 -- timeout — not treated as a failure).
-function A.Inception_Post(payload, endpoint)
+function A.Inception_Post(payload, endpoint, dbg, api_root_override, token_override)
   local http = require("socket.http")
-  local dbg  = isDebuggingEnabled()
   http.TIMEOUT = HTTP_TIMEOUT_LONGPOLL
+
+  local api_root, api_token = getSecrets()
+  api_root = api_root_override or api_root
+  api_token = token_override or api_token
+
+  if not api_root or not api_token then
+    log("INCEPTION: Missing API_ROOT or api_token in secrets or configuration.")
+    return nil
+  end
 
   local body, code, _, status = http.request {
     method  = "POST",
-    url     = API_ROOT .. "/" .. endpoint,
+    url     = api_root .. "/" .. endpoint,
     headers = {
       ["Accept"]        = "application/json",
       ["Authorization"] = "APIToken " .. api_token,
@@ -408,13 +444,15 @@ end
 --      params are populated before the first long-poll response arrives.
 -- =============================================================================
 
-local function _discoverEntities()
-  local dbg = isDebuggingEnabled()
+local function _discoverEntities(cfg_obj, cbus_net, dbg)
+  local monitor_tbl = cfg_obj and (cfg_obj.monitor or cfg_obj.MONITOR_CONFIG) or DEFAULT_MONITOR_CONFIG
+  local api_root_override = cfg_obj and cfg_obj.api_url
+  local token_override    = cfg_obj and cfg_obj.api_token
 
   -- ── System info ─────────────────────────────────────────────────────────────
   -- Log the system name and serial number so it is easy to confirm which
   -- Inception controller the script is connected to.
-  local sysinfo = Inception_Get("api/v1/system-info")
+  local sysinfo = Inception_Get("api/v1/system-info", api_root_override, token_override)
   if sysinfo then
     log("INCEPTION: connected to '" .. tostring(sysinfo["SystemName"])
         .. "' [S/N: " .. tostring(sysinfo["SerialNumber"]) .. "]")
@@ -425,7 +463,7 @@ local function _discoverEntities()
   local entityMap = {}
 
   for _, entityType in ipairs(ENTITY_TYPES) do
-    local summary = Inception_Get(SUMMARY_ENDPOINTS[entityType])
+    local summary = Inception_Get(SUMMARY_ENDPOINTS[entityType], api_root_override, token_override)
     if not summary then
       log("INCEPTION: could not fetch " .. entityType .. " summary – skipping.")
     else
@@ -459,7 +497,7 @@ local function _discoverEntities()
       end
 
       -- ── Match MONITOR_CONFIG entries against discovered entities ────────────
-      local configEntries = MONITOR_CONFIG[entityType .. "s"] or {}
+      local configEntries = monitor_tbl[entityType .. "s"] or {}
       for _, cfg in ipairs(configEntries) do
         local id = _entityIds[entityType][cfg.name]
         if not id then
@@ -476,20 +514,22 @@ local function _discoverEntities()
             end
           end
 
+          local param_name = getParamName(cfg_obj, cfg.param or cfg.name, cfg.param)
+
           -- Register this entity for long-poll state processing.
           entityMap[#entityMap + 1] = {
             id    = id,
-            param = cfg.param,
+            param = param_name,
             type  = entityType,
           }
 
           -- Write the current state to C-Bus immediately so params are
           -- populated before the first long-poll response arrives.
           local decoded = decodeBitmask(state, FLAGS[entityType])
-          safeSetUserParam(CBUS_NETWORK, cfg.param, decoded, dbg)
+          safeSetUserParam(cbus_net, param_name, decoded, dbg)
 
           debuglog("INCEPTION: mapped " .. entityType .. " '" .. cfg.name
-                   .. "' → " .. cfg.param
+                   .. "' → " .. param_name
                    .. " (ID: " .. id .. ")"
                    .. " initial state: " .. decoded, dbg)
         end
@@ -510,7 +550,7 @@ end
 
 -- Handles a MonitorEntityStates response — decodes updated entity states and
 -- writes them to their corresponding C-Bus user params.
-local function _handleEntityStates(result, dbg)
+local function _handleEntityStates(result, cbus_net, dbg)
   local responseId = tostring(result["ID"])
   local resultData = result["Result"]
 
@@ -539,7 +579,7 @@ local function _handleEntityStates(result, dbg)
           local flagSet = FLAGS[entry.type]
           if flagSet then
             local status = decodeBitmask(publicState, flagSet)
-            safeSetUserParam(CBUS_NETWORK, entry.param, status, dbg)
+            safeSetUserParam(cbus_net, entry.param, status, dbg)
             debuglog("INCEPTION: " .. entry.param .. " = " .. status, dbg)
           end
           break
@@ -551,7 +591,7 @@ end
 
 -- Handles a LiveReviewEvents response — writes the most recent event description
 -- to REVIEW_EVENT_PARAM and advances the reference tokens for the next request.
-local function _handleReviewEvents(result, dbg)
+local function _handleReviewEvents(result, review_param, cbus_net, dbg)
   local events = result["Result"]
   if not events or #events == 0 then return end
 
@@ -578,7 +618,7 @@ local function _handleReviewEvents(result, dbg)
     label = label .. " @ " .. when
   end
 
-  safeSetUserParam(CBUS_NETWORK, REVIEW_EVENT_PARAM, label, dbg)
+  safeSetUserParam(cbus_net, review_param, label, dbg)
   debuglog("INCEPTION: review event – " .. label, dbg)
 
   -- When debug is on, log every received event for full visibility.
@@ -595,7 +635,7 @@ end
 -- Handles an ActivityProgress response — logs the arm/disarm result and writes
 -- it to ALARM_DETAIL_PARAM. Removes the activity from _pendingActivities once
 -- it reaches a terminal state (Success or Failure).
-local function _handleActivityProgress(result, dbg)
+local function _handleActivityProgress(result, detail_param, cbus_net, dbg)
   local resultData = result["Result"]
   if not resultData then return end
 
@@ -625,7 +665,7 @@ local function _handleActivityProgress(result, dbg)
       local label = "Success"
       log("INCEPTION: activity " .. (pending and pending.label or actId)
           .. " – Success")
-      safeSetUserParam(CBUS_NETWORK, ALARM_DETAIL_PARAM, label, dbg)
+      safeSetUserParam(cbus_net, detail_param, label, dbg)
       _pendingActivities[actId] = nil
 
     elseif state == 3 then
@@ -633,7 +673,7 @@ local function _handleActivityProgress(result, dbg)
       local label = "Failed: " .. text
       log("INCEPTION: activity " .. (pending and pending.label or actId)
           .. " – FAILED: " .. text)
-      safeSetUserParam(CBUS_NETWORK, ALARM_DETAIL_PARAM, label, dbg)
+      safeSetUserParam(cbus_net, detail_param, label, dbg)
       _pendingActivities[actId] = nil
 
     else
@@ -671,7 +711,7 @@ end
 -- Arms or disarms an alarm area and registers the activity for progress monitoring.
 -- id     : area GUID — use inception.GetEntityId("area", "House")
 -- C_type : "Disarm", "Arm", "ArmStay", or "ArmSleep"
-function A.Control_Area(id, C_type)
+function A.Control_Area(id, C_type, config_override)
   if not id then
     log("INCEPTION: Control_Area called with nil id – ignoring.")
     return nil
@@ -681,6 +721,11 @@ function A.Control_Area(id, C_type)
     return nil
   end
 
+  local cfg = config_override or {}
+  local cbus_net = cfg.cbus_network or DEFAULT_CBUS_NETWORK
+  local dbg = isDebuggingEnabled(cbus_net, cfg.debug_param, cfg.debug)
+  local detail_param = getParamName(cfg, "alarmstate_detail", DEFAULT_ALARM_DETAIL_PARAM)
+
   local json    = require("json")
   local payload = json.encode({
     Type            = "ControlArea",
@@ -689,7 +734,7 @@ function A.Control_Area(id, C_type)
     ExitDelay       = true,
   })
 
-  local body = A.Inception_Post(payload, "control/area/" .. id .. "/activity")
+  local body = A.Inception_Post(payload, "control/area/" .. id .. "/activity", dbg, cfg.api_url, cfg.api_token)
   if not body then
     log("INCEPTION: Control_Area – " .. tostring(C_type) .. " – no response")
     return nil
@@ -717,8 +762,8 @@ function A.Control_Area(id, C_type)
   else
     log("INCEPTION: Control_Area – " .. tostring(C_type)
         .. " – FAILED: " .. message)
-    safeSetUserParam(CBUS_NETWORK, ALARM_DETAIL_PARAM,
-                     "Failed: " .. message, isDebuggingEnabled())
+    safeSetUserParam(cbus_net, detail_param,
+                     "Failed: " .. message, dbg)
   end
 
   return response
@@ -729,7 +774,7 @@ end
 -- C_type   : "Lock", "Unlock", "Open", "TimedUnlock", "Lockout",
 --            "Reinstate", "ToggleLock", "MuteHeldResponse", "CancelAccessRequests"
 -- timeSecs : (optional) duration in seconds for timed operations e.g. TimedUnlock
-function A.Control_Door(id, C_type, timeSecs)
+function A.Control_Door(id, C_type, timeSecs, config_override)
   if not id then
     log("INCEPTION: Control_Door called with nil id – ignoring.")
     return nil
@@ -739,12 +784,16 @@ function A.Control_Door(id, C_type, timeSecs)
     return nil
   end
 
+  local cfg = config_override or {}
+  local cbus_net = cfg.cbus_network or DEFAULT_CBUS_NETWORK
+  local dbg = isDebuggingEnabled(cbus_net, cfg.debug_param, cfg.debug)
+
   local json    = require("json")
   local payload = { Type = "ControlDoor", DoorControlType = C_type, Entity = id }
   if timeSecs then payload["TimeSecs"] = timeSecs end
 
   local body = A.Inception_Post(json.encode(payload),
-                                "control/door/" .. id .. "/activity")
+                                "control/door/" .. id .. "/activity", dbg, cfg.api_url, cfg.api_token)
   if not body then
     log("INCEPTION: Control_Door – " .. tostring(C_type) .. " – no response")
     return nil
@@ -774,7 +823,7 @@ end
 -- C_type   : "On", "Off", "Toggle", or "Pulse"
 -- timeSecs : (optional) duration in seconds — output returns to previous state
 --            after this time. Applicable to On and Pulse.
-function A.Control_Output(id, C_type, timeSecs)
+function A.Control_Output(id, C_type, timeSecs, config_override)
   if not id then
     log("INCEPTION: Control_Output called with nil id – ignoring.")
     return nil
@@ -784,12 +833,16 @@ function A.Control_Output(id, C_type, timeSecs)
     return nil
   end
 
+  local cfg = config_override or {}
+  local cbus_net = cfg.cbus_network or DEFAULT_CBUS_NETWORK
+  local dbg = isDebuggingEnabled(cbus_net, cfg.debug_param, cfg.debug)
+
   local json    = require("json")
   local payload = { Type = "ControlOutput", OutputControlType = C_type, Entity = id }
   if timeSecs then payload["TimeSecs"] = timeSecs end
 
   local body = A.Inception_Post(json.encode(payload),
-                                "control/output/" .. id .. "/activity")
+                                "control/output/" .. id .. "/activity", dbg, cfg.api_url, cfg.api_token)
   if not body then
     log("INCEPTION: Control_Output – " .. tostring(C_type) .. " – no response")
     return nil
@@ -840,15 +893,19 @@ function A.outputeval(res) return decodeBitmask(res, OUTPUT_FLAGS) end
 -- Called on every timer tick by the C-Bus resident script.
 -- =============================================================================
 
-function A.Resident_Poll()
-  local dbg = isDebuggingEnabled()
+function A.Resident_Poll(config)
+  local cfg = config or {}
+  local cbus_net = cfg.cbus_network or DEFAULT_CBUS_NETWORK
+  local dbg = isDebuggingEnabled(cbus_net, cfg.debug_param, cfg.debug)
+  local review_param = getParamName(cfg, "last_alarm_event", DEFAULT_REVIEW_EVENT_PARAM)
+  local detail_param = getParamName(cfg, "alarmstate_detail", DEFAULT_ALARM_DETAIL_PARAM)
 
   -- ── Entity discovery ────────────────────────────────────────────────────────
   -- Runs once on the first call. Logs system info and available entities,
   -- resolves MONITOR_CONFIG names to GUIDs, and writes initial state to C-Bus.
   -- On subsequent calls this block is a no-op.
   if _entityMap == nil then
-    _entityMap = _discoverEntities()
+    _entityMap = _discoverEntities(cfg, cbus_net, dbg)
     if #_entityMap == 0 then
       log("INCEPTION: no entities matched MONITOR_CONFIG – check configuration.")
     end
@@ -908,7 +965,7 @@ function A.Resident_Poll()
   -- ── Poll the API ────────────────────────────────────────────────────────────
   -- Blocks for up to HTTP_TIMEOUT_LONGPOLL seconds waiting for any event.
   -- Returns nil if nothing changed (normal) or on error (backoff applied).
-  local body = A.Inception_Post(payload, "monitor-updates")
+  local body = A.Inception_Post(payload, "monitor-updates", dbg, cfg.api_url, cfg.api_token)
   if isempty(body) then return end
 
   -- ── Parse and dispatch response ─────────────────────────────────────────────
@@ -923,13 +980,13 @@ function A.Resident_Poll()
   local responseId = tostring(result["ID"] or "")
 
   if responseId == "CBUS-Review-Monitor" then
-    _handleReviewEvents(result, dbg)
+    _handleReviewEvents(result, review_param, cbus_net, dbg)
 
   elseif responseId:find("^CBUS%-Activity%-") then
-    _handleActivityProgress(result, dbg)
+    _handleActivityProgress(result, detail_param, cbus_net, dbg)
 
   elseif result["Result"] and result["Result"]["stateData"] then
-    _handleEntityStates(result, dbg)
+    _handleEntityStates(result, cbus_net, dbg)
 
   else
     debuglog("INCEPTION: unhandled response ID: " .. responseId, dbg)
