@@ -44,10 +44,7 @@
 --   matching user params in C-Bus with the same names.
 -- =============================================================================
 
-local ok_sec, sec_mod = pcall(require, "user.secrets")
-if not ok_sec then
-  pcall(require, "secrets")
-end
+local secrets = require("user.secrets")
 
 -- inception is the public module table, registered as a global so C-Bus can
 -- call inception.Resident_Poll() and control functions from any script.
@@ -55,7 +52,7 @@ local A = {}
 inception = A
 
 -- =============================================================================
--- CONFIGURATION & DEFAULTS
+-- CONSTANTS & DEFAULTS
 -- =============================================================================
 
 -- Inception REST API base URL and API token helper
@@ -80,9 +77,6 @@ local HTTP_TIMEOUT_LONGPOLL = 61
 
 -- Default C-Bus network name that owns all Inception user parameters.
 local DEFAULT_CBUS_NETWORK = "Ethernet"
-
--- Default name of the C-Bus user param used as a debug-logging toggle.
-local DEFAULT_DEBUG_PARAM = "Debug Logging"
 
 -- Default C-Bus user param that receives the most recent security/access review event.
 local DEFAULT_REVIEW_EVENT_PARAM = "last_alarm_event"
@@ -237,12 +231,14 @@ local _missingParamWarned = {}
 -- =============================================================================
 
 -- Returns true if explicit_debug is true or if the C-Bus user param evaluates directly to boolean true.
-local function isDebuggingEnabled(network, custom_debug_param, explicit_debug)
+local function isDebuggingEnabled(network, debug_param, explicit_debug)
   if explicit_debug == true then return true end
-  local net = network or DEFAULT_CBUS_NETWORK
-  local param_name = custom_debug_param or DEFAULT_DEBUG_PARAM
-  local ok, val = pcall(GetUserParam, net, param_name)
-  return ok and val == true
+  if debug_param and type(debug_param) == "string" and #debug_param > 0 then
+    local net = network or DEFAULT_CBUS_NETWORK
+    local ok, val = pcall(GetUserParam, net, debug_param)
+    return ok and val == true
+  end
+  return false
 end
 
 -- Writes str to the C-Bus log only when debugEnabled is true.
@@ -281,13 +277,13 @@ local function safeSetUserParam(network, name, value, debugEnabled)
 end
 
 -- Resolve C-Bus UserParam name (checks config.cbus_params overrides first, then falls back to prefix or default)
-local function getParamName(config, attr, default_suffix)
-  local params = config and config.cbus_params or {}
-  if params[attr] and type(params[attr]) == "string" and #params[attr] > 0 then
-    return params[attr]
+local function getParamName(config, name)
+  local params = config and config.cbus_params
+  if params and params[name] then
+    return params[name]
   end
   local pfx = (config and config.param_prefix) or ""
-  return pfx .. (default_suffix or attr)
+  return pfx .. name
 end
 
 -- =============================================================================
@@ -514,7 +510,7 @@ local function _discoverEntities(cfg_obj, cbus_net, dbg)
             end
           end
 
-          local param_name = getParamName(cfg_obj, cfg.param or cfg.name, cfg.param)
+          local param_name = getParamName(cfg_obj, cfg.param or cfg.name)
 
           -- Register this entity for long-poll state processing.
           entityMap[#entityMap + 1] = {
@@ -722,9 +718,9 @@ function A.Control_Area(id, C_type, config_override)
   end
 
   local cfg = config_override or {}
-  local cbus_net = cfg.cbus_network or DEFAULT_CBUS_NETWORK
-  local dbg = isDebuggingEnabled(cbus_net, cfg.debug_param, cfg.debug)
-  local detail_param = getParamName(cfg, "alarmstate_detail", DEFAULT_ALARM_DETAIL_PARAM)
+  local CBUS_NETWORK = cfg.cbus_network or DEFAULT_CBUS_NETWORK
+  local dbg = isDebuggingEnabled(CBUS_NETWORK, cfg.debug_param, cfg.debug)
+  local detail_param = getParamName(cfg, "alarmstate_detail")
 
   local json    = require("json")
   local payload = json.encode({
@@ -762,7 +758,7 @@ function A.Control_Area(id, C_type, config_override)
   else
     log("INCEPTION: Control_Area – " .. tostring(C_type)
         .. " – FAILED: " .. message)
-    safeSetUserParam(cbus_net, detail_param,
+    safeSetUserParam(CBUS_NETWORK, detail_param,
                      "Failed: " .. message, dbg)
   end
 
@@ -785,8 +781,8 @@ function A.Control_Door(id, C_type, timeSecs, config_override)
   end
 
   local cfg = config_override or {}
-  local cbus_net = cfg.cbus_network or DEFAULT_CBUS_NETWORK
-  local dbg = isDebuggingEnabled(cbus_net, cfg.debug_param, cfg.debug)
+  local CBUS_NETWORK = cfg.cbus_network or DEFAULT_CBUS_NETWORK
+  local dbg = isDebuggingEnabled(CBUS_NETWORK, cfg.debug_param, cfg.debug)
 
   local json    = require("json")
   local payload = { Type = "ControlDoor", DoorControlType = C_type, Entity = id }
@@ -834,8 +830,8 @@ function A.Control_Output(id, C_type, timeSecs, config_override)
   end
 
   local cfg = config_override or {}
-  local cbus_net = cfg.cbus_network or DEFAULT_CBUS_NETWORK
-  local dbg = isDebuggingEnabled(cbus_net, cfg.debug_param, cfg.debug)
+  local CBUS_NETWORK = cfg.cbus_network or DEFAULT_CBUS_NETWORK
+  local dbg = isDebuggingEnabled(CBUS_NETWORK, cfg.debug_param, cfg.debug)
 
   local json    = require("json")
   local payload = { Type = "ControlOutput", OutputControlType = C_type, Entity = id }
@@ -895,17 +891,17 @@ function A.outputeval(res) return decodeBitmask(res, OUTPUT_FLAGS) end
 
 function A.Resident_Poll(config)
   local cfg = config or {}
-  local cbus_net = cfg.cbus_network or DEFAULT_CBUS_NETWORK
-  local dbg = isDebuggingEnabled(cbus_net, cfg.debug_param, cfg.debug)
-  local review_param = getParamName(cfg, "last_alarm_event", DEFAULT_REVIEW_EVENT_PARAM)
-  local detail_param = getParamName(cfg, "alarmstate_detail", DEFAULT_ALARM_DETAIL_PARAM)
+  local CBUS_NETWORK = cfg.cbus_network or DEFAULT_CBUS_NETWORK
+  local dbg = isDebuggingEnabled(CBUS_NETWORK, cfg.debug_param, cfg.debug)
+  local review_param = getParamName(cfg, "last_alarm_event")
+  local detail_param = getParamName(cfg, "alarmstate_detail")
 
   -- ── Entity discovery ────────────────────────────────────────────────────────
   -- Runs once on the first call. Logs system info and available entities,
   -- resolves MONITOR_CONFIG names to GUIDs, and writes initial state to C-Bus.
   -- On subsequent calls this block is a no-op.
   if _entityMap == nil then
-    _entityMap = _discoverEntities(cfg, cbus_net, dbg)
+    _entityMap = _discoverEntities(cfg, CBUS_NETWORK, dbg)
     if #_entityMap == 0 then
       log("INCEPTION: no entities matched MONITOR_CONFIG – check configuration.")
     end
@@ -980,13 +976,13 @@ function A.Resident_Poll(config)
   local responseId = tostring(result["ID"] or "")
 
   if responseId == "CBUS-Review-Monitor" then
-    _handleReviewEvents(result, review_param, cbus_net, dbg)
+    _handleReviewEvents(result, review_param, CBUS_NETWORK, dbg)
 
   elseif responseId:find("^CBUS%-Activity%-") then
-    _handleActivityProgress(result, detail_param, cbus_net, dbg)
+    _handleActivityProgress(result, detail_param, CBUS_NETWORK, dbg)
 
   elseif result["Result"] and result["Result"]["stateData"] then
-    _handleEntityStates(result, cbus_net, dbg)
+    _handleEntityStates(result, CBUS_NETWORK, dbg)
 
   else
     debuglog("INCEPTION: unhandled response ID: " .. responseId, dbg)
