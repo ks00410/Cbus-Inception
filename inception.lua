@@ -110,16 +110,6 @@ local DEFAULT_MONITOR_CONFIG = {
   },
 }
 
--- Named param constants — kept for backwards compatibility so that external
--- scripts can reference param names without hardcoding strings.
-A.CBUS_USERPARAM_NAME_ALARMSTATE = "alarmstate"
-A.CBUS_USERPARAM_NAME_FRONTDOOR  = "frontdoor"
-A.CBUS_USERPARAM_NAME_REARDOOR   = "reardoor"
-A.CBUS_USERPARAM_NAME_ZONES = {
-  "security_zone1", "security_zone2", "security_zone3", "security_zone4",
-  "security_zone5", "security_zone6", "security_zone7", "security_zone8",
-}
-
 -- =============================================================================
 -- LOOKUP TABLES
 -- Static data tables used throughout the script.
@@ -871,18 +861,6 @@ function A.ResetDiscovery()
   _entityMap = nil
   _entityIds = {}
 end
-
--- Decodes an AreaPublicStates bitmask into a readable state string.
-function A.areaeval(res)   return decodeBitmask(res, AREA_FLAGS)   end
-
--- Decodes a DoorPublicStates bitmask into a readable state string.
-function A.dooreval(res)   return decodeBitmask(res, DOOR_FLAGS)   end
-
--- Decodes an InputPublicStates bitmask into a readable state string.
-function A.inputeval(res)  return decodeBitmask(res, INPUT_FLAGS)  end
-
--- Decodes an OutputPublicStates bitmask into a readable state string.
-function A.outputeval(res) return decodeBitmask(res, OUTPUT_FLAGS) end
 
 -- =============================================================================
 -- RESIDENT POLL
